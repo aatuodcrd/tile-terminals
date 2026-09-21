@@ -1,16 +1,19 @@
 # Tile Terminals
 
-A tiny macOS utility that detects how many **Terminal.app** windows you have open and automatically arranges them into a non-overlapping grid that fills your screen.
+A tiny macOS utility that detects how many **Terminal.app** and **iTerm2** windows you have open and automatically arranges them into a non-overlapping grid that fills your screen.
 
-No more dragging and resizing windows by hand — run it and every Terminal window snaps into a clean, near-square layout that uses the full visible area of your main display (minus the menu bar and Dock).
+Whichever of the two apps are running get tiled together in a single grid; neither is launched if it isn't already open.
+
+No more dragging and resizing windows by hand — run it and every terminal window snaps into a clean layout that uses the full visible area of your main display (minus the menu bar and Dock).
 
 ## Features
 
 - **Auto-counts real windows.** Terminal's scripting API lists one "window" per *tab*, so a window with N tabs appears N times — and only one of those actually controls the frame. Tile Terminals probes each window object to find the genuinely controllable ones and tiles only those.
-- **Near-square grid.** Picks a column/row count close to a square so the layout looks balanced no matter how many windows you have.
+- **At most two rows.** Every window keeps at least half the screen height, so a tall terminal stays readable however many you have open.
 - **Fills the screen.** The last row stretches to use the full width, leaving no wasted space.
 - **Restores minimized windows** so they get tiled too.
-- **One permission, one time.** Only needs the "control Terminal" automation permission on first run.
+- **One permission, one time.** Only needs the "control Terminal" / "control iTerm" automation permission on first run.
+- **Starts instantly.** Detects running apps with `running of application`, not System Events' `exists process` — the latter blocks for ~12 seconds when the app you ask about *isn't* running.
 
 ## Usage
 
@@ -37,10 +40,12 @@ You can also bind it to a keyboard shortcut with a tool like [Raycast](https://r
 
 ## How it works
 
-The script reads your main display's visible frame (via `NSScreen`), converts it from Cocoa's bottom-left coordinate system to Terminal's top-left bounds coordinates, then:
+The script reads your main display's visible frame (via `NSScreen`), converts it from Cocoa's bottom-left coordinate system to the terminal's top-left bounds coordinates, then:
 
 1. **Pass A** — assigns each window a unique probe position and reads it back; only windows whose position "stuck" are real, controllable windows (this filters out ghost tab-duplicates).
-2. Computes a near-square grid: `cols = ceil(sqrt(n))`, `rows = ceil(n / cols)`.
+2. Computes the grid: `rows = min(n, 2)`, `cols = ceil(n / rows)`.
+
+   iTerm has no ghost tab-duplicates, so its windows skip Pass A and are taken as-is.
 3. **Pass B** — places windows row by row, stretching the final row to fill the width.
 
 See [`Tile Terminals.applescript`](Tile%20Terminals.applescript) for the fully commented source.
@@ -48,7 +53,7 @@ See [`Tile Terminals.applescript`](Tile%20Terminals.applescript) for the fully c
 ## Requirements
 
 - macOS (tested on recent versions)
-- The built-in **Terminal.app**
+- **Terminal.app** and/or **iTerm2** — at least one of them running
 
 ## License
 
