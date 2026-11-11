@@ -13,7 +13,7 @@ No more dragging and resizing windows by hand — run it and every terminal wind
 - **Stacked panes aren't squashed.** An iTerm window whose panes are split top/bottom gets a full-height column (landscape) or a band two rows tall (portrait). On landscape it uses whole grid columns (7 panes over 2 rows = 4 columns), so it may get a screen to itself.
 - **One desktop at a time.** Only windows on the desktop (Space) you're looking at are tiled; other desktops are left alone, so you can tile each desktop separately.
 - **Overflow goes to the Dock.** Windows that don't fit anywhere are minimized; minimized iTerm windows come back when there's room. (macOS doesn't let scripts move windows to another desktop/Space.) Minimized Terminal windows are left alone.
-- **No wasted space.** Rows and columns stretch to fill each screen; two windows sit side by side.
+- **No wasted space, nothing hidden.** Rows and columns stretch to fill each screen; two windows sit side by side. Tiled windows are brought in front of other apps (without jumping to another desktop).
 - **One permission, one time.** Only needs the "control Terminal" / "control iTerm" automation permission on first run.
 - **Starts instantly.** Detects running apps with `running of application`, not System Events' `exists process` — the latter blocks for ~12 seconds when the app you ask about *isn't* running.
 

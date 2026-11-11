@@ -150,6 +150,31 @@ repeat with wRef in overflow
 	if not (mini of wRef) then my setMini(wRef, true)
 end repeat
 
+-- 7) Bring the tiled windows in front of other apps (e.g. a browser covering
+-- them). Make the front-most tiled window the app's own front window first:
+-- activating an app jumps to the desktop of ITS front window, which may be on
+-- another desktop. The app holding the front-most window is raised last.
+-- Skipped in the fallback, where tiled windows may span desktops.
+if hereList is not missing value then
+	set placedList to {}
+	repeat with wRef in winRefs
+		if not (wRef is in overflow) then set end of placedList to contents of wRef
+	end repeat
+	if (count placedList) > 0 then
+		set topApp to appName of item 1 of placedList
+		set raiseOrder to {"Terminal", "iTerm"}
+		if topApp is "Terminal" then set raiseOrder to {"iTerm", "Terminal"}
+		repeat with appN in raiseOrder
+			repeat with wRef in placedList
+				if appName of wRef is (contents of appN) then
+					my raise(wRef)
+					exit repeat
+				end if
+			end repeat
+		end repeat
+	end if
+end if
+
 -- Readable cells a window uses on a screen. A stacked-pane window uses whole
 -- columns on a 1-2 row screen (7 panes over 2 rows = 4 columns = 8 cells), or a
 -- full-width band two rows tall on a taller (portrait) screen.
@@ -244,6 +269,22 @@ on place(wRef, x1, y1, x2, y2)
 		tell application (appName of wRef) to set bounds of window id (winID of wRef) to theBounds
 	end try
 end place
+
+on raise(wRef)
+	try
+		if (appName of wRef) is "iTerm" then
+			tell application "iTerm"
+				select window id (winID of wRef)
+				activate
+			end tell
+		else
+			tell application "Terminal"
+				set index of window id (winID of wRef) to 1
+				activate
+			end tell
+		end if
+	end try
+end raise
 
 -- App named literally: "miniaturized" only resolves with the app's dictionary.
 on setMini(wRef, flag)
