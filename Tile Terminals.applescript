@@ -2,11 +2,11 @@
 --
 -- Whichever of the two apps are running get tiled together (neither is launched).
 --
--- Readable size: every pane gets at least minColW x minRowH pixels, so each
--- screen holds a fixed number of panes (1920x1003 -> 4 cols x 2 rows = 8).
--- Windows are placed most-recently-used first (front of the window stack),
--- filling the main screen, then the other screens. Windows that don't fit are
--- minimized to the Dock; minimized windows come back only if there is room.
+-- Readable size: every pane gets at least about minColW x minRowH pixels, so
+-- each screen holds a fixed number of panes (1920x1003 -> 4 cols x 2 rows = 8).
+-- Windows are placed most-recently-used first (front-to-back order), filling
+-- the main screen, then the other screens. Windows that don't fit are minimized
+-- to the Dock; minimized iTerm windows come back only if there is room.
 -- Only windows on the desktop (Space) you are looking at are touched; other
 -- desktops are left alone, so you can tile each desktop separately. (macOS gives
 -- scripts no way to move windows to another desktop/Space.)
@@ -14,13 +14,8 @@
 -- Split panes get more room: a window's weight is the number of panes in its
 -- visible tab (iTerm), so a 7-pane window gets 7x the area of a 1-pane one.
 -- Tabs add nothing, since only one tab shows at a time. Terminal = weight 1.
--- A window whose panes are stacked top/bottom gets a full-height column instead
--- of a half-height cell, so its pane rows don't get squashed.
---
--- Terminal's scripting lists one "window" object per TAB, so a window with N
--- tabs shows up N times and only one of them actually controls the frame. To
--- count REAL windows we probe: give each window object a unique position, read
--- it back, and keep only the ones that "stuck". iTerm has no such ghost tabs.
+-- A window whose panes are stacked top/bottom gets a full-height column
+-- (landscape) or a two-row-tall band (portrait), so its pane rows aren't squashed.
 --
 -- Needs the one-time "control Terminal"/"control iTerm" automation permission.
 use framework "Foundation"
@@ -34,13 +29,14 @@ property minRowH : 450
 
 -- 1) Every screen's usable area (minus menu bar + Dock), in the terminals'
 -- top-left-origin coords. NSScreen's first screen is the one with the menu bar.
+-- The +1/4 slack keeps a side Dock or a few lost pixels from dropping a column.
 set screenList to current application's NSScreen's screens() as list
 set mainH to item 2 of item 2 of ((item 1 of screenList)'s frame() as list)
 set screens to {}
 repeat with sc in screenList
 	set {{vx, vy}, {vw, vh}} to sc's visibleFrame() as list
-	set c to (vw div minColW) as integer
-	set r to (vh div minRowH) as integer
+	set c to ((vw + minColW / 4) div minColW) as integer
+	set r to ((vh + minRowH / 4) div minRowH) as integer
 	if c < 1 then set c to 1
 	if r < 1 then set r to 1
 	set end of screens to {x:vx as integer, y:(mainH - (vy + vh)) as integer, w:vw as integer, h:vh as integer, maxRows:r, cols:c, cap:c * r, used:0, wins:{}}
@@ -52,39 +48,24 @@ end repeat
 -- and checking for a closed Terminal is the normal case.
 set hasTerm to running of application "Terminal"
 set hasITerm to running of application "iTerm"
+if not (hasTerm or hasITerm) then return
 
--- 3) Collect windows as {appName, winID, weight, tall, mini}, front-most first;
--- minimized ones go last so open windows keep their place
-set winRefs to {}
+-- 3) Windows on THIS desktop, front to back, as {owner, id} pairs. macOS's
+-- on-screen window list has exactly that, and its window numbers are the same
+-- ids iTerm/Terminal use. It also skips Terminal's hidden per-tab "windows".
+set hereList to missing value
+try
+	set hereList to run script "ObjC.import('CoreGraphics'); ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(1 | 16, 0))).filter(w => w.kCGWindowLayer == 0 && /^(iTerm2?|Terminal)$/.test(w.kCGWindowOwnerName)).map(w => [w.kCGWindowOwnerName == 'Terminal' ? 'Terminal' : 'iTerm', w.kCGWindowNumber])" in "JavaScript"
+end try
+
+-- 4) Collect windows as {appName, winID, weight, tall, mini}: on-screen ones in
+-- front-to-back order, then minimized iTerm windows (they wait in the Dock).
+-- Minimized Terminal windows are left alone.
+set iRefs to {}
 set miniRefs to {}
-set mx to x of item 1 of screens
-set my_ to y of item 1 of screens
-
-if hasTerm then
-	tell application "Terminal"
-		repeat with w in windows
-			try
-				set miniaturized of w to false
-			end try
-		end repeat
-	end tell
-	repeat with theID in my realTerminalWindows(mx, my_)
-		set end of winRefs to {appName:"Terminal", winID:(contents of theID), weight:1, tall:false, mini:false}
-	end repeat
-end if
-
 if hasITerm then
-	-- Accessibility only sees windows on the current desktop (minimized ones
-	-- included). Without that permission, fall back to every window.
-	set hereNames to missing value
-	try
-		tell application "System Events" to set hereNames to name of every window of process "iTerm2"
-	end try
 	tell application "iTerm"
 		repeat with w in windows
-			if hereNames is not missing value and (name of w) is not in hereNames then
-				-- on another desktop: leave it where it is
-			else
 			set wt to 1
 			set isTall to false
 			set isMini to false
@@ -104,16 +85,39 @@ if hasITerm then
 			if isMini then
 				set end of miniRefs to wRef
 			else
-				set end of winRefs to wRef
-			end if
+				set end of iRefs to wRef
 			end if
 		end repeat
 	end tell
 end if
+
+set winRefs to {}
+if hereList is not missing value then
+	repeat with pair in hereList
+		if item 1 of pair is "Terminal" then
+			set end of winRefs to {appName:"Terminal", winID:(item 2 of pair), weight:1, tall:false, mini:false}
+		else
+			repeat with wRef in iRefs
+				if winID of wRef = (item 2 of pair) then
+					set end of winRefs to contents of wRef
+					exit repeat
+				end if
+			end repeat
+		end if
+	end repeat
+else
+	-- Fallback (window list unreadable): every window, current one first.
+	if hasTerm then
+		repeat with theID in my realTerminalWindows(x of item 1 of screens, y of item 1 of screens)
+			set end of winRefs to {appName:"Terminal", winID:(contents of theID), weight:1, tall:false, mini:false}
+		end repeat
+	end if
+	set winRefs to winRefs & iRefs
+end if
 set winRefs to winRefs & miniRefs
 if (count winRefs) is 0 then return
 
--- 4) Hand out screens: each window goes to the first screen with room for its
+-- 5) Hand out screens: each window goes to the first screen with room for its
 -- panes. A window bigger than a whole screen still gets an empty screen to itself.
 set overflow to {}
 repeat with wRef in winRefs
@@ -121,7 +125,7 @@ repeat with wRef in winRefs
 	set placed to false
 	repeat with i from 1 to count screens
 		set sc to item i of screens
-		set cost to my cellCost(wRef, maxRows of sc)
+		set cost to my cellCost(wRef, maxRows of sc, cols of sc)
 		if ((used of sc) + cost <= (cap of sc)) or ((used of sc) = 0) then
 			set used of sc to (used of sc) + cost
 			set end of wins of sc to wRef
@@ -133,7 +137,7 @@ repeat with wRef in winRefs
 	if not placed then set end of overflow to wRef
 end repeat
 
--- 5) Lay out each screen; minimize what didn't fit
+-- 6) Lay out each screen; minimize what didn't fit
 repeat with sc in screens
 	if (count wins of sc) > 0 then
 		repeat with wRef in wins of sc
@@ -146,47 +150,85 @@ repeat with wRef in overflow
 	if not (mini of wRef) then my setMini(wRef, true)
 end repeat
 
--- Readable cells a window uses on a screen. A stacked-pane window spans the full
--- height, so it uses whole columns: 7 panes over 2 rows = 4 columns = 8 cells.
-on cellCost(wRef, maxRows)
-	if (tall of wRef) and maxRows <= 2 then return (((weight of wRef) + maxRows - 1) div maxRows) * maxRows
-	return weight of wRef
+-- Readable cells a window uses on a screen. A stacked-pane window uses whole
+-- columns on a 1-2 row screen (7 panes over 2 rows = 4 columns = 8 cells), or a
+-- full-width band two rows tall on a taller (portrait) screen.
+on cellCost(wRef, maxRows, cols)
+	if not (tall of wRef) then return weight of wRef
+	if maxRows <= 2 then return (((weight of wRef) + maxRows - 1) div maxRows) * maxRows
+	return 2 * cols
 end cellCost
 
--- One screen: stacked-pane windows get full-height columns on the left, whole
--- readable cells wide (only with 1-2 rows; on a tall portrait screen that column
--- would be too narrow and a full-width row is tall enough). The rest fill up to
--- maxRows equal rows; in a row each window's width is proportional to its weight.
+-- One screen. Stacked-pane windows first: full-height columns on the left
+-- (1-2 rows) or two-row bands across the top (taller screens); if nothing else
+-- shares the screen they stretch to fill it. The rest fill as few equal rows as
+-- their panes need (so 2 windows sit side by side); in a row each window's
+-- width is proportional to its weight.
 on layoutScreen(winList, uLeft, uTop, uW, uH, maxRows, cols)
 	set tallList to {}
 	set restList to {}
+	set restW to 0
+	set tallCols to 0
 	repeat with wRef in winList
-		if (tall of wRef) and maxRows <= 2 then
+		if tall of wRef then
 			set end of tallList to contents of wRef
+			set tallCols to tallCols + (cellCost(wRef, maxRows, cols) div maxRows)
 		else
 			set end of restList to contents of wRef
+			set restW to restW + (weight of wRef)
 		end if
 	end repeat
-	set x1 to uLeft
-	repeat with wRef in tallList
-		set x2 to x1 + uW * (cellCost(wRef, maxRows) div maxRows) / cols
-		if x2 > uLeft + uW or (count winList) = 1 then set x2 to uLeft + uW
-		place(wRef, x1, uTop, x2, uTop + uH)
-		set x1 to x2
-	end repeat
+	set gLeft to uLeft
+	set gTop to uTop
+	set gW to uW
+	set gH to uH
+	set gCols to cols
+	set gRows to maxRows
+	if (count tallList) > 0 then
+		if maxRows <= 2 then
+			-- columns: whole grid columns wide, or share the full width if alone
+			set denom to cols
+			if (count restList) = 0 or tallCols >= cols then set denom to tallCols
+			set x1 to uLeft
+			repeat with wRef in tallList
+				set x2 to x1 + uW * (cellCost(wRef, maxRows, cols) div maxRows) / denom
+				place(wRef, x1, uTop, x2, uTop + uH)
+				set x1 to x2
+			end repeat
+			set gLeft to x1
+			set gW to uLeft + uW - x1
+			set gCols to cols - tallCols
+		else
+			-- bands: two rows tall, or share the full height if alone
+			set bandH to uH * 2 / maxRows
+			if (count restList) = 0 or (count tallList) * 2 >= maxRows then set bandH to uH / (count tallList)
+			set y1 to uTop
+			repeat with wRef in tallList
+				place(wRef, uLeft, y1, uLeft + uW, y1 + bandH)
+				set y1 to y1 + bandH
+			end repeat
+			set gTop to y1
+			set gH to uTop + uH - y1
+			set gRows to maxRows - 2 * (count tallList)
+		end if
+	end if
 	if (count restList) is 0 then return
-	set gLeft to x1
-	set gW to uLeft + uW - x1
-	set rowList to splitRows(restList, maxRows)
+	if gCols < 1 then set gCols to 1
+	if gRows < 1 then set gRows to 1
+	-- as few rows as the panes need
+	set needRows to (restW + gCols - 1) div gCols
+	if needRows < gRows then set gRows to needRows
+	if gRows < 1 then set gRows to 1
+	set rowList to splitRows(restList, gRows)
 	set rows to count rowList
-	set cellH to uH / rows
+	set cellH to gH / rows
 	repeat with r from 1 to rows
 		set theRow to item r of rowList
 		set rowW to 0
 		repeat with wRef in theRow
 			set rowW to rowW + (weight of wRef)
 		end repeat
-		set y1 to uTop + (r - 1) * cellH
+		set y1 to gTop + (r - 1) * cellH
 		set x1 to gLeft
 		repeat with wRef in theRow
 			set x2 to x1 + gW * (weight of wRef) / rowW
