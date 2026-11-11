@@ -1,29 +1,46 @@
--- Tile every Terminal AND iTerm window into one non-overlapping grid that fills the screen.
+-- Tile every Terminal AND iTerm window across your screens, at a size people can read.
 --
--- Whichever of the two apps are running get tiled together in a single grid:
--- only Terminal -> Terminal windows; only iTerm -> iTerm windows; both -> all of them.
+-- Whichever of the two apps are running get tiled together (neither is launched).
 --
--- Terminal's scripting lists one "window" object per TAB, so a window with N
--- tabs shows up N times and only one of them actually controls the frame. To
--- count REAL windows we probe: give each window object a unique position, read
--- it back, and keep only the ones that "stuck". iTerm has no such ghost tabs,
--- so for iTerm we take every window as-is.
+-- Readable size: every pane gets at least about minColW x minRowH pixels, so
+-- each screen holds a fixed number of panes (1920x1003 -> 4 cols x 2 rows = 8).
+-- Windows are placed most-recently-used first (front-to-back order). Windows
+-- that don't fit are minimized to the Dock; minimized iTerm windows come back
+-- (to the main screen's desktop showing now) only if there is room.
+-- Every desktop (Space) is tiled, each on the screen it belongs to. Windows
+-- stay on their desktop and screen (macOS gives scripts no way to move windows
+-- between desktops, and won't reliably move one onto another screen's desktop).
+--
+-- Split panes get more room: a window's weight is the number of panes in its
+-- visible tab (iTerm), so a 7-pane window gets 7x the area of a 1-pane one.
+-- Tabs add nothing, since only one tab shows at a time. Terminal = weight 1.
+-- A window whose panes are stacked top/bottom gets a full-height column
+-- (landscape) or a two-row-tall band (portrait), so its pane rows aren't squashed.
 --
 -- Needs the one-time "control Terminal"/"control iTerm" automation permission.
 use framework "Foundation"
 use framework "AppKit"
 use scripting additions
 
--- 1) Main display geometry (Cocoa coords: bottom-left origin)
-set theScreen to current application's NSScreen's mainScreen()
-set {{fx, fy}, {fw, fh}} to theScreen's frame()           -- full display
-set {{vx, vy}, {vw, vh}} to theScreen's visibleFrame()    -- minus menu bar + Dock
+-- Smallest readable pane: ~60 columns x ~25 lines of text plus pane chrome.
+-- Calibration knobs: lower them to fit more per screen, raise for bigger text.
+property minColW : 480
+property minRowH : 450
 
--- Convert the visible area to the terminal's bounds coords (top-left origin)
-set uLeft to vx as integer
-set uTop to (fh - (vy + vh)) as integer
-set uW to vw as integer
-set uH to vh as integer
+-- 1) Every screen's usable area (minus menu bar + Dock), in the terminals'
+-- top-left-origin coords. NSScreen's first screen is the one with the menu bar.
+-- The +1/4 slack keeps a side Dock or a few lost pixels from dropping a column.
+set screenList to current application's NSScreen's screens() as list
+set mainH to item 2 of item 2 of ((item 1 of screenList)'s frame() as list)
+set screens to {}
+repeat with sc in screenList
+	set {{vx, vy}, {vw, vh}} to sc's visibleFrame() as list
+	set c to ((vw + minColW / 4) div minColW) as integer
+	set r to ((vh + minRowH / 4) div minRowH) as integer
+	if c < 1 then set c to 1
+	if r < 1 then set r to 1
+	set end of screens to {x:vx as integer, y:(mainH - (vy + vh)) as integer, w:vw as integer, h:vh as integer, maxRows:r, cols:c, cap:c * r, used:0, wins:{}}
+end repeat
 
 -- 2) See which terminals are running (don't launch one that isn't)
 -- "running" doesn't launch the app. System Events' "exists process X" is not an
@@ -31,66 +48,350 @@ set uH to vh as integer
 -- and checking for a closed Terminal is the normal case.
 set hasTerm to running of application "Terminal"
 set hasITerm to running of application "iTerm"
+if not (hasTerm or hasITerm) then return
 
--- 3) Collect the real, controllable windows from each running app as {appName, winID}
-set winRefs to {}
-
-if hasTerm then
-	tell application "Terminal"
-		activate
-		repeat with w in windows
-			try
-				set miniaturized of w to false
-			end try
+-- 3) Group windows by desktop (Space): {{screen index}, {{owner, id}, ...}, showing now?},
+-- windows front to back. Each desktop is tiled on the screen it belongs to:
+-- macOS won't reliably move a window onto another screen's desktop. Desktops
+-- not showing are done first; the ones showing now last (main screen's last).
+-- macOS's window list gives the window ids (the same ids iTerm/Terminal use);
+-- a read-only private call says which desktop each window is on. Full-screen
+-- desktops are skipped, and Terminal windows are only tiled on desktops
+-- showing now (its hidden per-tab "windows" can't be told apart elsewhere).
+-- ponytail: private CGS* calls; if macOS drops them we fall back to the
+-- public on-screen list (desktops showing now, pooled across screens).
+set groups to missing value
+try
+	set groups to run script "ObjC.import('CoreGraphics'); ObjC.import('AppKit');
+ObjC.bindFunction('CGSMainConnectionID', ['int', []]);
+ObjC.bindFunction('CGSCopyManagedDisplaySpaces', ['id', ['int']]);
+ObjC.bindFunction('CGSCopySpacesForWindows', ['id', ['int', 'int', 'id']]);
+ObjC.bindFunction('CGDisplayCreateUUIDFromDisplayID', ['void *', ['unsigned int']]);
+ObjC.bindFunction('CFUUIDCreateString', ['id', ['void *', 'void *']]);
+var cid = $.CGSMainConnectionID();
+var uuids = $.NSScreen.screens.js.map(s => ObjC.unwrap($.CFUUIDCreateString(null, $.CGDisplayCreateUUIDFromDisplayID(ObjC.unwrap(s.deviceDescription.objectForKey('NSScreenNumber'))))));
+var cur = {}, spaceScr = {}, groups = {}, order = [];
+ObjC.deepUnwrap($.CGSCopyManagedDisplaySpaces(cid)).forEach(d => {
+  var i = uuids.indexOf(d['Display Identifier']) + 1;
+  if (i < 1) return;
+  cur[d['Current Space'].ManagedSpaceID] = true;
+  d.Spaces.forEach(s => { if (!s.type) spaceScr[s.ManagedSpaceID] = i; });
+});
+ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(0, 0)))
+  .filter(w => w.kCGWindowLayer == 0 && /^(iTerm2?|Terminal)$/.test(w.kCGWindowOwnerName))
+  .forEach(w => {
+    var app = w.kCGWindowOwnerName == 'Terminal' ? 'Terminal' : 'iTerm';
+    var sp = ObjC.deepUnwrap($.CGSCopySpacesForWindows(cid, 7, $([w.kCGWindowNumber]))) || [];
+    if (sp.length != 1 || !spaceScr[sp[0]]) return;
+    var here = !!cur[sp[0]];
+    if (app == 'Terminal' && !(here && w.kCGWindowIsOnscreen)) return;
+    if (!groups[sp[0]]) { groups[sp[0]] = [[spaceScr[sp[0]]], [], here]; order.push(sp[0]); }
+    groups[sp[0]][1].push([app, w.kCGWindowNumber]);
+  });
+order.sort((a, b) => (groups[a][2] - groups[b][2]) || (groups[b][0][0] - groups[a][0][0]));
+order.map(k => groups[k]);" in "JavaScript"
+end try
+if groups is missing value then
+	try
+		set allIdx to {}
+		repeat with i from 1 to count screens
+			set end of allIdx to i
 		end repeat
-	end tell
-	repeat with theID in my realTerminalWindows(uLeft, uTop)
-		set end of winRefs to {appName:"Terminal", winID:(contents of theID)}
-	end repeat
+		set groups to {{allIdx, run script "ObjC.import('CoreGraphics'); ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(1 | 16, 0))).filter(w => w.kCGWindowLayer == 0 && /^(iTerm2?|Terminal)$/.test(w.kCGWindowOwnerName)).map(w => [w.kCGWindowOwnerName == 'Terminal' ? 'Terminal' : 'iTerm', w.kCGWindowNumber])" in "JavaScript", true}}
+	end try
 end if
 
+-- 4) Collect iTerm windows as {appName, winID, weight, tall, mini}.
+-- Minimized Terminal windows are left alone.
+set iRefs to {}
+set miniRefs to {}
 if hasITerm then
 	tell application "iTerm"
-		activate
 		repeat with w in windows
+			set wt to 1
+			set isTall to false
+			set isMini to false
 			try
-				set miniaturized of w to false
+				set isMini to miniaturized of w
 			end try
+			try
+				set t to current tab of w
+				set wt to count sessions of t
+				if wt > 1 then
+					set {bx1, by1, bx2, by2} to bounds of w
+					set isTall to my panesStacked(columns of every session of t, rows of every session of t, bx2 - bx1, by2 - by1)
+				end if
+			end try
+			if wt < 1 then set wt to 1
+			set wRef to {appName:"iTerm", winID:(id of w), weight:wt, tall:isTall, mini:isMini}
+			if isMini then
+				set end of miniRefs to wRef
+			else
+				set end of iRefs to wRef
+			end if
 		end repeat
-		set iIDs to id of every window
 	end tell
-	repeat with theID in iIDs
-		set end of winRefs to {appName:"iTerm", winID:(contents of theID)}
-	end repeat
 end if
 
-set n to count winRefs
-if n is 0 then return
-
--- 4) At most 2 rows, so every window keeps at least half the screen height
-set rows to 2
-if n < 2 then set rows to n
-set cols to (round (n / rows) rounding up) as integer
-set cellH to uH / rows
-
--- 5) Place row by row; the last row stretches to fill the width
-repeat with r from 0 to rows - 1
-	set startIdx to r * cols
-	set inThisRow to cols
-	if (startIdx + cols) > n then set inThisRow to n - startIdx
-	set cellW to uW / inThisRow
-	set y1 to uTop + r * cellH
-	set y2 to y1 + cellH
-	repeat with c from 0 to inThisRow - 1
-		set wRef to item (startIdx + c + 1) of winRefs
-		set x1 to uLeft + c * cellW
-		set x2 to x1 + cellW
-		set theBounds to {x1 as integer, y1 as integer, x2 as integer, y2 as integer}
-		try
-			tell application (appName of wRef) to set bounds of window id (winID of wRef) to theBounds
-		end try
+if groups is missing value then
+	-- Fallback (window lists unreadable): every window as one group, no raise.
+	set winRefs to {}
+	if hasTerm then
+		repeat with theID in my realTerminalWindows(x of item 1 of screens, y of item 1 of screens)
+			set end of winRefs to {appName:"Terminal", winID:(contents of theID), weight:1, tall:false, mini:false}
+		end repeat
+	end if
+	set allIdx to {}
+	repeat with i from 1 to count screens
+		set end of allIdx to i
 	end repeat
+	my tileGroup(winRefs & iRefs & miniRefs, allIdx, screens, false)
+	return
+end if
+
+-- Minimized iTerm windows join the last group (the main screen's showing
+-- desktop): restoring a window brings it to the desktop you're on.
+repeat with gi from 1 to count groups
+	set g to item gi of groups
+	set winRefs to {}
+	repeat with pair in item 2 of g
+		if item 1 of pair is "Terminal" then
+			set end of winRefs to {appName:"Terminal", winID:(item 2 of pair), weight:1, tall:false, mini:false}
+		else
+			repeat with wRef in iRefs
+				if winID of wRef = (item 2 of pair) then
+					set end of winRefs to contents of wRef
+					exit repeat
+				end if
+			end repeat
+		end if
+	end repeat
+	if gi = (count groups) and (item 3 of g) then set winRefs to winRefs & miniRefs
+	my tileGroup(winRefs, item 1 of g, screens, item 3 of g)
 end repeat
+
+-- Tile one group of windows on the given screens (indexes into allScreens).
+on tileGroup(winRefs, scrIdx, allScreens, doRaise)
+	if (count winRefs) is 0 then return
+	set gScr to {}
+	repeat with i in scrIdx
+		set sc to item (contents of i) of allScreens
+		set end of gScr to {x:x of sc, y:y of sc, w:w of sc, h:h of sc, maxRows:maxRows of sc, cols:cols of sc, cap:cap of sc, used:0, wins:{}}
+	end repeat
+
+	-- Each window goes to the first screen with room for its panes. A window
+	-- bigger than a whole screen still gets an empty screen to itself.
+	set overflow to {}
+	repeat with wRef in winRefs
+		set wRef to contents of wRef
+		set placed to false
+		repeat with i from 1 to count gScr
+			set sc to item i of gScr
+			set cost to cellCost(wRef, maxRows of sc, cols of sc)
+			if ((used of sc) + cost <= (cap of sc)) or ((used of sc) = 0) then
+				set used of sc to (used of sc) + cost
+				set end of wins of sc to wRef
+				set item i of gScr to sc
+				set placed to true
+				exit repeat
+			end if
+		end repeat
+		if not placed then set end of overflow to wRef
+	end repeat
+
+	-- Lay out each screen; minimize what didn't fit
+	repeat with sc in gScr
+		if (count wins of sc) > 0 then
+			repeat with wRef in wins of sc
+				if mini of wRef then setMini(wRef, false)
+			end repeat
+			layoutScreen(wins of sc, x of sc, y of sc, w of sc, h of sc, maxRows of sc, cols of sc)
+		end if
+	end repeat
+	repeat with wRef in overflow
+		if not (mini of wRef) then setMini(wRef, true)
+	end repeat
+
+	-- Bring the tiled windows in front of other apps (e.g. a browser covering
+	-- them). Make the front-most tiled window the app's own front window first:
+	-- activating an app jumps to the desktop of ITS front window, which may be on
+	-- another desktop. The app holding the front-most window is raised last.
+	if not doRaise then return
+	set placedList to {}
+	repeat with wRef in winRefs
+		if not (wRef is in overflow) then set end of placedList to contents of wRef
+	end repeat
+	if (count placedList) is 0 then return
+	set topApp to appName of item 1 of placedList
+	set raiseOrder to {"Terminal", "iTerm"}
+	if topApp is "Terminal" then set raiseOrder to {"iTerm", "Terminal"}
+	repeat with appN in raiseOrder
+		repeat with wRef in placedList
+			if appName of wRef is (contents of appN) then
+				raise(wRef)
+				exit repeat
+			end if
+		end repeat
+	end repeat
+end tileGroup
+
+-- Readable cells a window uses on a screen. A stacked-pane window uses whole
+-- columns on a 1-2 row screen (7 panes over 2 rows = 4 columns = 8 cells), or a
+-- full-width band two rows tall on a taller (portrait) screen.
+on cellCost(wRef, maxRows, cols)
+	if not (tall of wRef) then return weight of wRef
+	if maxRows <= 2 then return (((weight of wRef) + maxRows - 1) div maxRows) * maxRows
+	return 2 * cols
+end cellCost
+
+-- One screen. Stacked-pane windows first: full-height columns on the left
+-- (1-2 rows) or two-row bands across the top (taller screens); if nothing else
+-- shares the screen they stretch to fill it. The rest fill as few equal rows as
+-- their panes need (so 2 windows sit side by side); in a row each window's
+-- width is proportional to its weight.
+on layoutScreen(winList, uLeft, uTop, uW, uH, maxRows, cols)
+	set tallList to {}
+	set restList to {}
+	set restW to 0
+	set tallCols to 0
+	repeat with wRef in winList
+		if tall of wRef then
+			set end of tallList to contents of wRef
+			set tallCols to tallCols + (cellCost(wRef, maxRows, cols) div maxRows)
+		else
+			set end of restList to contents of wRef
+			set restW to restW + (weight of wRef)
+		end if
+	end repeat
+	set gLeft to uLeft
+	set gTop to uTop
+	set gW to uW
+	set gH to uH
+	set gCols to cols
+	set gRows to maxRows
+	if (count tallList) > 0 then
+		if maxRows <= 2 then
+			-- columns: whole grid columns wide, or share the full width if alone
+			set denom to cols
+			if (count restList) = 0 or tallCols >= cols then set denom to tallCols
+			set x1 to uLeft
+			repeat with wRef in tallList
+				set x2 to x1 + uW * (cellCost(wRef, maxRows, cols) div maxRows) / denom
+				place(wRef, x1, uTop, x2, uTop + uH)
+				set x1 to x2
+			end repeat
+			set gLeft to x1
+			set gW to uLeft + uW - x1
+			set gCols to cols - tallCols
+		else
+			-- bands: two rows tall, or share the full height if alone
+			set bandH to uH * 2 / maxRows
+			if (count restList) = 0 or (count tallList) * 2 >= maxRows then set bandH to uH / (count tallList)
+			set y1 to uTop
+			repeat with wRef in tallList
+				place(wRef, uLeft, y1, uLeft + uW, y1 + bandH)
+				set y1 to y1 + bandH
+			end repeat
+			set gTop to y1
+			set gH to uTop + uH - y1
+			set gRows to maxRows - 2 * (count tallList)
+		end if
+	end if
+	if (count restList) is 0 then return
+	if gCols < 1 then set gCols to 1
+	if gRows < 1 then set gRows to 1
+	-- as few rows as the panes need
+	set needRows to (restW + gCols - 1) div gCols
+	if needRows < gRows then set gRows to needRows
+	if gRows < 1 then set gRows to 1
+	set rowList to splitRows(restList, gRows)
+	set rows to count rowList
+	set cellH to gH / rows
+	repeat with r from 1 to rows
+		set theRow to item r of rowList
+		set rowW to 0
+		repeat with wRef in theRow
+			set rowW to rowW + (weight of wRef)
+		end repeat
+		set y1 to gTop + (r - 1) * cellH
+		set x1 to gLeft
+		repeat with wRef in theRow
+			set x2 to x1 + gW * (weight of wRef) / rowW
+			place(wRef, x1, y1, x2, y1 + cellH)
+			set x1 to x2
+		end repeat
+	end repeat
+end layoutScreen
+
+on place(wRef, x1, y1, x2, y2)
+	set theBounds to {x1 as integer, y1 as integer, x2 as integer, y2 as integer}
+	try
+		tell application (appName of wRef) to set bounds of window id (winID of wRef) to theBounds
+	end try
+end place
+
+on raise(wRef)
+	try
+		if (appName of wRef) is "iTerm" then
+			tell application "iTerm"
+				select window id (winID of wRef)
+				activate
+			end tell
+		else
+			tell application "Terminal"
+				set index of window id (winID of wRef) to 1
+				activate
+			end tell
+		end if
+	end try
+end raise
+
+-- App named literally: "miniaturized" only resolves with the app's dictionary.
+on setMini(wRef, flag)
+	try
+		if (appName of wRef) is "iTerm" then
+			tell application "iTerm" to set miniaturized of window id (winID of wRef) to flag
+		else
+			tell application "Terminal" to set miniaturized of window id (winID of wRef) to flag
+		end if
+	end try
+end setMini
+
+-- Split windows into up to maxRows rows of roughly equal total weight:
+-- heaviest first, each into the currently lightest row.
+on splitRows(winRefs, maxRows)
+	set n to count winRefs
+	set k to maxRows
+	if n < k then set k to n
+	set rowList to {}
+	set rowWt to {}
+	repeat k times
+		set end of rowList to {}
+		set end of rowWt to 0
+	end repeat
+	set todo to winRefs
+	repeat n times
+		set best to 1
+		repeat with i from 2 to count todo
+			if (weight of item i of todo) > (weight of item best of todo) then set best to i
+		end repeat
+		set wRef to item best of todo
+		if best = 1 then
+			set todo to rest of todo
+		else if best = (count todo) then
+			set todo to items 1 thru (best - 1) of todo
+		else
+			set todo to (items 1 thru (best - 1) of todo) & (items (best + 1) thru -1 of todo)
+		end if
+		set lightest to 1
+		repeat with i from 2 to k
+			if (item i of rowWt) < (item lightest of rowWt) then set lightest to i
+		end repeat
+		set end of item lightest of rowList to wRef
+		set item lightest of rowWt to (item lightest of rowWt) + (weight of wRef)
+	end repeat
+	return rowList
+end splitRows
 
 -- Terminal only: find the real windows, skipping ghost-tab duplicates.
 on realTerminalWindows(uLeft, uTop)
@@ -115,3 +416,13 @@ on realTerminalWindows(uLeft, uTop)
 		return winIDs
 	end tell
 end realTerminalWindows
+on panesStacked(colList, rowList, pxW, pxH)
+	set cells to 0
+	set minRows to item 1 of rowList
+	repeat with k from 1 to count colList
+		set cells to cells + (item k of colList) * (item k of rowList)
+		if (item k of rowList) < minRows then set minRows to item k of rowList
+	end repeat
+	if minRows < 1 or pxW < 1 then return false
+	return (pxH * cells / 2) >= (3.24 * pxW * minRows * minRows)
+end panesStacked
