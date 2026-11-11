@@ -4,12 +4,12 @@
 --
 -- Readable size: every pane gets at least about minColW x minRowH pixels, so
 -- each screen holds a fixed number of panes (1920x1003 -> 4 cols x 2 rows = 8).
--- Windows are placed most-recently-used first (front-to-back order), filling
--- the main screen, then the other screens. Windows that don't fit are minimized
--- to the Dock; minimized iTerm windows come back only if there is room.
--- Only windows on the desktop (Space) you are looking at are touched; other
--- desktops are left alone, so you can tile each desktop separately. (macOS gives
--- scripts no way to move windows to another desktop/Space.)
+-- Windows are placed most-recently-used first (front-to-back order). Windows
+-- that don't fit are minimized to the Dock; minimized iTerm windows come back
+-- (to the main screen's desktop showing now) only if there is room.
+-- Every desktop (Space) is tiled, each on the screen it belongs to. Windows
+-- stay on their desktop and screen (macOS gives scripts no way to move windows
+-- between desktops, and won't reliably move one onto another screen's desktop).
 --
 -- Split panes get more room: a window's weight is the number of panes in its
 -- visible tab (iTerm), so a 7-pane window gets 7x the area of a 1-pane one.
@@ -50,16 +50,58 @@ set hasTerm to running of application "Terminal"
 set hasITerm to running of application "iTerm"
 if not (hasTerm or hasITerm) then return
 
--- 3) Windows on THIS desktop, front to back, as {owner, id} pairs. macOS's
--- on-screen window list has exactly that, and its window numbers are the same
--- ids iTerm/Terminal use. It also skips Terminal's hidden per-tab "windows".
-set hereList to missing value
+-- 3) Group windows by desktop (Space): {{screen index}, {{owner, id}, ...}, showing now?},
+-- windows front to back. Each desktop is tiled on the screen it belongs to:
+-- macOS won't reliably move a window onto another screen's desktop. Desktops
+-- not showing are done first; the ones showing now last (main screen's last).
+-- macOS's window list gives the window ids (the same ids iTerm/Terminal use);
+-- a read-only private call says which desktop each window is on. Full-screen
+-- desktops are skipped, and Terminal windows are only tiled on desktops
+-- showing now (its hidden per-tab "windows" can't be told apart elsewhere).
+-- ponytail: private CGS* calls; if macOS drops them we fall back to the
+-- public on-screen list (desktops showing now, pooled across screens).
+set groups to missing value
 try
-	set hereList to run script "ObjC.import('CoreGraphics'); ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(1 | 16, 0))).filter(w => w.kCGWindowLayer == 0 && /^(iTerm2?|Terminal)$/.test(w.kCGWindowOwnerName)).map(w => [w.kCGWindowOwnerName == 'Terminal' ? 'Terminal' : 'iTerm', w.kCGWindowNumber])" in "JavaScript"
+	set groups to run script "ObjC.import('CoreGraphics'); ObjC.import('AppKit');
+ObjC.bindFunction('CGSMainConnectionID', ['int', []]);
+ObjC.bindFunction('CGSCopyManagedDisplaySpaces', ['id', ['int']]);
+ObjC.bindFunction('CGSCopySpacesForWindows', ['id', ['int', 'int', 'id']]);
+ObjC.bindFunction('CGDisplayCreateUUIDFromDisplayID', ['void *', ['unsigned int']]);
+ObjC.bindFunction('CFUUIDCreateString', ['id', ['void *', 'void *']]);
+var cid = $.CGSMainConnectionID();
+var uuids = $.NSScreen.screens.js.map(s => ObjC.unwrap($.CFUUIDCreateString(null, $.CGDisplayCreateUUIDFromDisplayID(ObjC.unwrap(s.deviceDescription.objectForKey('NSScreenNumber'))))));
+var cur = {}, spaceScr = {}, groups = {}, order = [];
+ObjC.deepUnwrap($.CGSCopyManagedDisplaySpaces(cid)).forEach(d => {
+  var i = uuids.indexOf(d['Display Identifier']) + 1;
+  if (i < 1) return;
+  cur[d['Current Space'].ManagedSpaceID] = true;
+  d.Spaces.forEach(s => { if (!s.type) spaceScr[s.ManagedSpaceID] = i; });
+});
+ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(0, 0)))
+  .filter(w => w.kCGWindowLayer == 0 && /^(iTerm2?|Terminal)$/.test(w.kCGWindowOwnerName))
+  .forEach(w => {
+    var app = w.kCGWindowOwnerName == 'Terminal' ? 'Terminal' : 'iTerm';
+    var sp = ObjC.deepUnwrap($.CGSCopySpacesForWindows(cid, 7, $([w.kCGWindowNumber]))) || [];
+    if (sp.length != 1 || !spaceScr[sp[0]]) return;
+    var here = !!cur[sp[0]];
+    if (app == 'Terminal' && !(here && w.kCGWindowIsOnscreen)) return;
+    if (!groups[sp[0]]) { groups[sp[0]] = [[spaceScr[sp[0]]], [], here]; order.push(sp[0]); }
+    groups[sp[0]][1].push([app, w.kCGWindowNumber]);
+  });
+order.sort((a, b) => (groups[a][2] - groups[b][2]) || (groups[b][0][0] - groups[a][0][0]));
+order.map(k => groups[k]);" in "JavaScript"
 end try
+if groups is missing value then
+	try
+		set allIdx to {}
+		repeat with i from 1 to count screens
+			set end of allIdx to i
+		end repeat
+		set groups to {{allIdx, run script "ObjC.import('CoreGraphics'); ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(1 | 16, 0))).filter(w => w.kCGWindowLayer == 0 && /^(iTerm2?|Terminal)$/.test(w.kCGWindowOwnerName)).map(w => [w.kCGWindowOwnerName == 'Terminal' ? 'Terminal' : 'iTerm', w.kCGWindowNumber])" in "JavaScript", true}}
+	end try
+end if
 
--- 4) Collect windows as {appName, winID, weight, tall, mini}: on-screen ones in
--- front-to-back order, then minimized iTerm windows (they wait in the Dock).
+-- 4) Collect iTerm windows as {appName, winID, weight, tall, mini}.
 -- Minimized Terminal windows are left alone.
 set iRefs to {}
 set miniRefs to {}
@@ -91,9 +133,28 @@ if hasITerm then
 	end tell
 end if
 
-set winRefs to {}
-if hereList is not missing value then
-	repeat with pair in hereList
+if groups is missing value then
+	-- Fallback (window lists unreadable): every window as one group, no raise.
+	set winRefs to {}
+	if hasTerm then
+		repeat with theID in my realTerminalWindows(x of item 1 of screens, y of item 1 of screens)
+			set end of winRefs to {appName:"Terminal", winID:(contents of theID), weight:1, tall:false, mini:false}
+		end repeat
+	end if
+	set allIdx to {}
+	repeat with i from 1 to count screens
+		set end of allIdx to i
+	end repeat
+	my tileGroup(winRefs & iRefs & miniRefs, allIdx, screens, false)
+	return
+end if
+
+-- Minimized iTerm windows join the last group (the main screen's showing
+-- desktop): restoring a window brings it to the desktop you're on.
+repeat with gi from 1 to count groups
+	set g to item gi of groups
+	set winRefs to {}
+	repeat with pair in item 2 of g
 		if item 1 of pair is "Terminal" then
 			set end of winRefs to {appName:"Terminal", winID:(item 2 of pair), weight:1, tall:false, mini:false}
 		else
@@ -105,75 +166,74 @@ if hereList is not missing value then
 			end repeat
 		end if
 	end repeat
-else
-	-- Fallback (window list unreadable): every window, current one first.
-	if hasTerm then
-		repeat with theID in my realTerminalWindows(x of item 1 of screens, y of item 1 of screens)
-			set end of winRefs to {appName:"Terminal", winID:(contents of theID), weight:1, tall:false, mini:false}
-		end repeat
-	end if
-	set winRefs to winRefs & iRefs
-end if
-set winRefs to winRefs & miniRefs
-if (count winRefs) is 0 then return
+	if gi = (count groups) and (item 3 of g) then set winRefs to winRefs & miniRefs
+	my tileGroup(winRefs, item 1 of g, screens, item 3 of g)
+end repeat
 
--- 5) Hand out screens: each window goes to the first screen with room for its
--- panes. A window bigger than a whole screen still gets an empty screen to itself.
-set overflow to {}
-repeat with wRef in winRefs
-	set wRef to contents of wRef
-	set placed to false
-	repeat with i from 1 to count screens
-		set sc to item i of screens
-		set cost to my cellCost(wRef, maxRows of sc, cols of sc)
-		if ((used of sc) + cost <= (cap of sc)) or ((used of sc) = 0) then
-			set used of sc to (used of sc) + cost
-			set end of wins of sc to wRef
-			set item i of screens to sc
-			set placed to true
-			exit repeat
+-- Tile one group of windows on the given screens (indexes into allScreens).
+on tileGroup(winRefs, scrIdx, allScreens, doRaise)
+	if (count winRefs) is 0 then return
+	set gScr to {}
+	repeat with i in scrIdx
+		set sc to item (contents of i) of allScreens
+		set end of gScr to {x:x of sc, y:y of sc, w:w of sc, h:h of sc, maxRows:maxRows of sc, cols:cols of sc, cap:cap of sc, used:0, wins:{}}
+	end repeat
+
+	-- Each window goes to the first screen with room for its panes. A window
+	-- bigger than a whole screen still gets an empty screen to itself.
+	set overflow to {}
+	repeat with wRef in winRefs
+		set wRef to contents of wRef
+		set placed to false
+		repeat with i from 1 to count gScr
+			set sc to item i of gScr
+			set cost to cellCost(wRef, maxRows of sc, cols of sc)
+			if ((used of sc) + cost <= (cap of sc)) or ((used of sc) = 0) then
+				set used of sc to (used of sc) + cost
+				set end of wins of sc to wRef
+				set item i of gScr to sc
+				set placed to true
+				exit repeat
+			end if
+		end repeat
+		if not placed then set end of overflow to wRef
+	end repeat
+
+	-- Lay out each screen; minimize what didn't fit
+	repeat with sc in gScr
+		if (count wins of sc) > 0 then
+			repeat with wRef in wins of sc
+				if mini of wRef then setMini(wRef, false)
+			end repeat
+			layoutScreen(wins of sc, x of sc, y of sc, w of sc, h of sc, maxRows of sc, cols of sc)
 		end if
 	end repeat
-	if not placed then set end of overflow to wRef
-end repeat
+	repeat with wRef in overflow
+		if not (mini of wRef) then setMini(wRef, true)
+	end repeat
 
--- 6) Lay out each screen; minimize what didn't fit
-repeat with sc in screens
-	if (count wins of sc) > 0 then
-		repeat with wRef in wins of sc
-			if mini of wRef then my setMini(wRef, false)
-		end repeat
-		my layoutScreen(wins of sc, x of sc, y of sc, w of sc, h of sc, maxRows of sc, cols of sc)
-	end if
-end repeat
-repeat with wRef in overflow
-	if not (mini of wRef) then my setMini(wRef, true)
-end repeat
-
--- 7) Bring the tiled windows in front of other apps (e.g. a browser covering
--- them). Make the front-most tiled window the app's own front window first:
--- activating an app jumps to the desktop of ITS front window, which may be on
--- another desktop. The app holding the front-most window is raised last.
--- Skipped in the fallback, where tiled windows may span desktops.
-if hereList is not missing value then
+	-- Bring the tiled windows in front of other apps (e.g. a browser covering
+	-- them). Make the front-most tiled window the app's own front window first:
+	-- activating an app jumps to the desktop of ITS front window, which may be on
+	-- another desktop. The app holding the front-most window is raised last.
+	if not doRaise then return
 	set placedList to {}
 	repeat with wRef in winRefs
 		if not (wRef is in overflow) then set end of placedList to contents of wRef
 	end repeat
-	if (count placedList) > 0 then
-		set topApp to appName of item 1 of placedList
-		set raiseOrder to {"Terminal", "iTerm"}
-		if topApp is "Terminal" then set raiseOrder to {"iTerm", "Terminal"}
-		repeat with appN in raiseOrder
-			repeat with wRef in placedList
-				if appName of wRef is (contents of appN) then
-					my raise(wRef)
-					exit repeat
-				end if
-			end repeat
+	if (count placedList) is 0 then return
+	set topApp to appName of item 1 of placedList
+	set raiseOrder to {"Terminal", "iTerm"}
+	if topApp is "Terminal" then set raiseOrder to {"iTerm", "Terminal"}
+	repeat with appN in raiseOrder
+		repeat with wRef in placedList
+			if appName of wRef is (contents of appN) then
+				raise(wRef)
+				exit repeat
+			end if
 		end repeat
-	end if
-end if
+	end repeat
+end tileGroup
 
 -- Readable cells a window uses on a screen. A stacked-pane window uses whole
 -- columns on a 1-2 row screen (7 panes over 2 rows = 4 columns = 8 cells), or a
